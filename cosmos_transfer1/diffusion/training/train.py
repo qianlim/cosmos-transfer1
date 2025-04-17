@@ -17,9 +17,12 @@ import argparse
 import importlib
 import os
 import time
+import torch
 import torch.distributed as dist
+
 from loguru import logger as logging
 from omegaconf import OmegaConf
+from megatron.core import parallel_state
 
 from cosmos_transfer1.diffusion.config.config import Config
 from cosmos_transfer1.utils import log, misc
@@ -50,6 +53,12 @@ def destroy_distributed():
     log.info("Destroying distributed environment...")
     if dist.is_available() and dist.is_initialized():
         try:
+            if parallel_state.get_tensor_model_parallel_world_size() > 1:
+                dist.barrier(group=parallel_state.get_tensor_model_parallel_group())
+            # Global barrier across all ranks
+            dist.barrier()
+
+            torch.cuda.empty_cache()
             dist.destroy_process_group()
         except ValueError as e:
             print(f"Error destroying default process group: {e}")
