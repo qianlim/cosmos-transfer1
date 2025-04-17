@@ -212,7 +212,7 @@ Now we can start a real training job! Removing the `--dryrun` and set `--nproc_p
 torchrun --nproc_per_node=8 -m cosmos_transfer1.diffusion.training.train --config=cosmos_transfer1/diffusion/config/config_train.py -- experiment=CTRL_7Bv1pt3_lvg_tp_121frames_control_input_edge_block3_pretrain
 ```
 
-**Config group and override**: An `experiment` determines a complete group of configuration parameters (model architecture, data, trainer behavior, checkpointing, etc.). Changing the `experiment` value in the command above will decide which ControlNet model is trained, and whether it's pretrain or post-train. For example, replacing the experiment name in the command with `CTRL_7Bv1pt3_lvg_tp_121frames_control_input_depth_block3_posttrain` will post-train the DepthControl model from the downloaded checkpoint instead.
+**Config group and override.** An `experiment` determines a complete group of configuration parameters (model architecture, data, trainer behavior, checkpointing, etc.). Changing the `experiment` value in the command above will decide which ControlNet model is trained, and whether it's pretrain or post-train. For example, replacing the experiment name in the command with `CTRL_7Bv1pt3_lvg_tp_121frames_control_input_depth_block3_posttrain` will post-train the DepthControl model from the downloaded checkpoint instead.
 
 To customize your training, see the job (experiment) config in `cosmos_transfer1/diffusion/config/training/experiment/ctrl_7b_tp_121frames.py` to understand they are defined, and edit as needed.
 
@@ -221,9 +221,10 @@ It is also possible to modify config parameters from command line. For example:
 ```bash
 torchrun --nproc_per_node=8 -m cosmos_transfer1.diffusion.training.train --config=cosmos_transfer1/diffusion/config/config_train.py -- experiment=CTRL_7Bv1pt3_lvg_tp_121frames_control_input_edge_block3_pretrain trainer.max_iter=100 checkpoint.save_iter=50
 ```
-This will update the maximum training iterations to 100 (by default they are 999999999 in the registered experiments) and checkpoint saving frequency to 50.
 
+This will update the maximum training iterations to 100 (default in the registered experiments: 999999999) and checkpoint saving frequency to 50 (default: 1000).
 
+**Saving Checkpoints and Resuming Training.**
 During the training, the checkpoints will be saved in the below structure. Since we use TensorParallel across 8 GPUs, 8 checkpoints will be saved each time.
 
 ```
@@ -237,5 +238,14 @@ checkpoints/cosmos_transfer1_pretrain/CTRL_7Bv1_lvg/CTRL_7Bv1pt3_lvg_tp_121frame
 
 Since the `experiment` is uniquely associated with its checkpoint directory, rerunning the same training command after an unexpected interruption will automatically resume from the latest saved checkpoint.
 
-### 7. (Optional) add your own control input modality
-See for a implement if you want to add your new control input types.
+## FAQ
+**Q1: What if I want to use my own control input type? How should I modify the code?**  
+**A1:** Modify the following scripts:
+- Add new condition in:
+  - `cosmos_transfer1/diffusion/conditioner.py`
+  - `cosmos_transfer1/diffusion/config/transfer/conditioner.py`
+- Add data augmentor function in `cosmos_transfer1/diffusion/datasets/augmentors/control_input.py`
+- Add new hint key in:
+  - `cosmos_transfer1/diffusion/inference/inference_utils.py`
+  - `cosmos_transfer1/diffusion/inference/world_generation_pipeline.py`
+- If needed, add preprocessor in `cosmos_transfer1/auxiliary/` and update `cosmos_transfer1/diffusion/inference/preprocessors.py`.
