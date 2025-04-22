@@ -13,24 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union
 from contextlib import nullcontext
+from typing import List, Optional, Union
 
 try:
     from megatron.core import parallel_state
+
     USE_MEGATRON = True
 except ImportError:
     USE_MEGATRON = False
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import transformer_engine as te
 from einops import rearrange
 from packaging import version
 from torch import nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend
+from torch.utils.checkpoint import checkpoint
 from transformer_engine.pytorch.attention import DotProductAttention, apply_rotary_pos_emb
 
 from cosmos_transfer1.utils import log
@@ -114,7 +115,7 @@ class FeedForward(nn.Module):
             x = g * self.linear_gate(x)
         else:
             x = g
-        
+
         assert self.dropout.p == 0.0, "skipping dropout to save memory"
         return self.layer2(x)
 
@@ -195,10 +196,11 @@ else:
         f"you are using PyTorch {torch.__version__}. You might want to consider upgrading."
     )
 
+
 class BaseAttentionOp(nn.Module):
     def __init__(self):
         super().__init__()
-    
+
 
 class FusedAttentionOp(BaseAttentionOp):
     def __init__(self):
@@ -217,7 +219,9 @@ class TorchAttentionOp(FusedAttentionOp):
                 "this context manager."
             )
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Computes the scaled dot-product attention over the input tensors using the specified backend.
         B is the batch size, M the sequence length, H the number of heads, and K the embeding size per head
@@ -243,7 +247,7 @@ class TorchAttentionOp(FusedAttentionOp):
         with self.sdpa_context(self.backend):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)  # scale is dim_head ** -0.5 per default
         return rearrange(out, "b h ... l -> b ... h l").view(*in_q_shape[:-1], in_k_shape[-1])
-    
+
 
 class Attention(nn.Module):
     """

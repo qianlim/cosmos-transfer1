@@ -17,12 +17,12 @@ import argparse
 import importlib
 import os
 import time
+
 import torch
 import torch.distributed as dist
-
 from loguru import logger as logging
-from omegaconf import OmegaConf
 from megatron.core import parallel_state
+from omegaconf import OmegaConf
 
 from cosmos_transfer1.diffusion.config.config import Config
 from cosmos_transfer1.utils import log, misc

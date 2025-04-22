@@ -44,18 +44,17 @@ iter_000000100_ema_model.pt
 """
 
 import os
+from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine as te
 import yaml
-
 from megatron.core import parallel_state
-from collections import OrderedDict
 
-from cosmos_transfer1.diffusion.training.train import instantiate_model
 from cosmos_transfer1.diffusion.config.config_train import make_config
+from cosmos_transfer1.diffusion.training.train import instantiate_model
 from cosmos_transfer1.utils import log
 from cosmos_transfer1.utils.config_helper import override
 from cosmos_transfer1.utils.easy_io import easy_io
@@ -72,9 +71,7 @@ def copy_params_from_tp(model: nn.Module, model_tp: nn.Module, tp_size: int) -> 
     match_layers = OrderedDict()
     ddp_group = parallel_state.get_data_parallel_group()
     tp_group = parallel_state.get_tensor_model_parallel_group()
-    assert tp_size == parallel_state.get_tensor_model_parallel_world_size(), (
-        "TP group init is wrong"
-    )
+    assert tp_size == parallel_state.get_tensor_model_parallel_world_size(), "TP group init is wrong"
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
     def record_match_layer(name, param, param_chunk, policy):
@@ -86,45 +83,29 @@ def copy_params_from_tp(model: nn.Module, model_tp: nn.Module, tp_size: int) -> 
             "type": "param",
         }
 
-    for (name, param), (name_tp, param_tp) in zip(
-        model.named_parameters(), model_tp.named_parameters()
-    ):
+    for (name, param), (name_tp, param_tp) in zip(model.named_parameters(), model_tp.named_parameters()):
         module_name_hierarchy = name.split(".")
         submodule_name = ".".join(module_name_hierarchy[:-1])
         submodule = model.get_submodule(submodule_name)
         submodule_tp = model_tp.get_submodule(submodule_name)
 
-        if isinstance(submodule, nn.Linear) and isinstance(
-            submodule_tp, te.pytorch.Linear
-        ):
+        if isinstance(submodule, nn.Linear) and isinstance(submodule_tp, te.pytorch.Linear):
             # get parallel mode and copy weights
             if module_name_hierarchy[-1] == "weight":
                 if submodule_tp.parallel_mode == "column":
                     param_chunks = param.chunk(tp_size, dim=0)
-                    record_match_layer(
-                        name, param, param_chunks[tp_rank], f"column_rank{tp_rank}"
-                    )
-                    param_tp_chunks = [
-                        torch.zeros_like(param_tp) for _ in range(tp_size)
-                    ]
+                    record_match_layer(name, param, param_chunks[tp_rank], f"column_rank{tp_rank}")
+                    param_tp_chunks = [torch.zeros_like(param_tp) for _ in range(tp_size)]
                     dist.all_gather(param_tp_chunks, param_tp, tp_group, async_op=False)
                     for _tp_rank in range(tp_size):
-                        param_chunks[_tp_rank].copy_(
-                            param_tp_chunks[_tp_rank], non_blocking=True
-                        )
+                        param_chunks[_tp_rank].copy_(param_tp_chunks[_tp_rank], non_blocking=True)
                 elif submodule_tp.parallel_mode == "row":
                     param_chunks = param.chunk(tp_size, dim=1)
-                    record_match_layer(
-                        name, param, param_chunks[tp_rank], f"row_rank{tp_rank}"
-                    )
-                    param_tp_chunks = [
-                        torch.zeros_like(param_tp) for _ in range(tp_size)
-                    ]
+                    record_match_layer(name, param, param_chunks[tp_rank], f"row_rank{tp_rank}")
+                    param_tp_chunks = [torch.zeros_like(param_tp) for _ in range(tp_size)]
                     dist.all_gather(param_tp_chunks, param_tp, tp_group, async_op=False)
                     for _tp_rank in range(tp_size):
-                        param_chunks[_tp_rank].copy_(
-                            param_tp_chunks[_tp_rank], non_blocking=True
-                        )
+                        param_chunks[_tp_rank].copy_(param_tp_chunks[_tp_rank], non_blocking=True)
                 else:
                     record_match_layer(name, param, param_tp, "direct")
                     param.copy_(param_tp, non_blocking=True)
@@ -135,9 +116,7 @@ def copy_params_from_tp(model: nn.Module, model_tp: nn.Module, tp_size: int) -> 
             param.copy_(param_tp, non_blocking=True)
 
     # Important to also copy buffer as logvar has randomness.
-    for (name, buffer), (name_tp, buffer_tp) in zip(
-        model.named_buffers(), model_tp.named_buffers()
-    ):
+    for (name, buffer), (name_tp, buffer_tp) in zip(model.named_buffers(), model_tp.named_buffers()):
         if buffer.size() == buffer_tp.size():
             match_layers[name] = {
                 "shape": buffer.shape,
@@ -154,22 +133,13 @@ def copy_params_from_tp(model: nn.Module, model_tp: nn.Module, tp_size: int) -> 
             if "model_ema" in name:
                 module_name = name.replace("-", ".")
                 module_name = module_name.replace("model_ema", "model")
-                if (
-                    "column" in match_layers[module_name]["policy"]
-                    or "row" in match_layers[module_name]["policy"]
-                ):
+                if "column" in match_layers[module_name]["policy"] or "row" in match_layers[module_name]["policy"]:
                     dim = 0 if "column" in match_layers[module_name]["policy"] else 1
                     buffer_chunks = buffer.chunk(tp_size, dim=dim)
-                    buffer_tp_chunks = [
-                        torch.zeros_like(buffer_tp) for _ in range(tp_size)
-                    ]
-                    dist.all_gather(
-                        buffer_tp_chunks, buffer_tp, tp_group, async_op=False
-                    )
+                    buffer_tp_chunks = [torch.zeros_like(buffer_tp) for _ in range(tp_size)]
+                    dist.all_gather(buffer_tp_chunks, buffer_tp, tp_group, async_op=False)
                     for _tp_rank in range(tp_size):
-                        buffer_chunks[_tp_rank].copy_(
-                            buffer_tp_chunks[_tp_rank], non_blocking=True
-                        )
+                        buffer_chunks[_tp_rank].copy_(buffer_tp_chunks[_tp_rank], non_blocking=True)
             else:
                 log.info(f"{name} is not copied due to size mismatch.")
 
@@ -247,9 +217,7 @@ def convert_tp_checkpoint_to_fsdp(
     # Set random seed by global rank to ensure diversity within TP groups
     set_random_seed(global_rank)
     model_tp = instantiate_model(config_tp, trainer_tp).cuda()
-    optimizer_tp, scheduler_tp = model_tp.init_optimizer_scheduler(
-        config_tp.optimizer, config_tp.scheduler
-    )
+    optimizer_tp, scheduler_tp = model_tp.init_optimizer_scheduler(config_tp.optimizer, config_tp.scheduler)
     grad_scaler_tp = torch.amp.GradScaler("cuda", **config_tp.trainer.grad_scaler_args)
 
     # Load checkpoint and prepare model for training
@@ -288,9 +256,7 @@ def convert_tp_checkpoint_to_fsdp(
         easy_io.dump(model.state_dict()["model"], reg_model_path)
 
         # Save EMA model checkpoint with necessary post-processing
-        ema_state_dict = {
-            k.replace("-", "."): v for k, v in model.state_dict()["ema"].items()
-        }
+        ema_state_dict = {k.replace("-", "."): v for k, v in model.state_dict()["ema"].items()}
         for key in ["net.pos_embedder.seq", "logvar.0.freqs", "logvar.0.phases"]:
             ema_state_dict[key] = model.state_dict()["model"][key]
 
@@ -302,9 +268,7 @@ def convert_tp_checkpoint_to_fsdp(
 
             ema_model_checkpoint_name = checkpoint_name.replace(".pt", "_ema_model.pt")
         else:
-            ema_model_checkpoint_name = checkpoint_name.replace(
-                ".pt", "_ema_model_only.pt"
-            )
+            ema_model_checkpoint_name = checkpoint_name.replace(".pt", "_ema_model_only.pt")
         ema_model_path = os.path.join(output_directory, ema_model_checkpoint_name)
         easy_io.dump(ema_state_dict, ema_model_path)
 
