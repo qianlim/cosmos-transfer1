@@ -184,7 +184,7 @@ PYTHONPATH=. python scripts/convert_ckpt_fsdp_to_tp.py checkpoints/nvidia/Cosmos
 ```
 This will generate the TP checkpoints under `checkpoints/checkpoints_tp/*_mp_*.pt`, which we load in the training below.
 
-### 5. (Optional): Dry-run a Training Job (Dry-run)
+### 5. (Optional): Dry-run a Training Job
 As a sanity check, run the following command to dry-run an example training job with the above data. The command will generated a full configuration of the experiment.
 
 ```bash
