@@ -1081,7 +1081,7 @@ class GeneralDITTransformerBlock(nn.Module):
         return x
 
     def set_memory_save(self, mode: bool = True):
-        # (qsh) to make fsdp happy!
+        # to make fsdp happy!
         #! IMPORTANT!
         if mode:
             self.forward = self.forward_with_memory_save

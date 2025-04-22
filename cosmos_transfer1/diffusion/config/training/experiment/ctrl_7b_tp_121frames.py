@@ -92,7 +92,7 @@ def make_ctrlnet_config_7b_training(
                 broadcast_via_filesystem=True,
                 save_iter=1000,  # 1000 iterations per checkpoint. Update as needed.
                 load_training_state=False,
-                strict_resume=True,
+                strict_resume=False,  # TODO (qianlim): temporary hack: We have excluded the base model ckpt from each full controlnet. The base model weights are loaded below, see 'base_load_from'.
                 keys_not_to_resume=[],
             ),
             trainer=dict(
@@ -191,8 +191,7 @@ for key in CTRL_HINT_KEYS_COMB.keys():
     hint_key_short = key.replace("control_input_", "")  # "control_input_vis" -> "vis"
     pretrain_ckpt_path = default_model_names[hint_key_short]
     # note: The TP ckpt path are specified as <name>.pt to the script, but actually the <name>_model_mp_*.pt files will be loaded.
-    # tp_ckpt_path = os.path.join("checkpoints", os.path.dirname(pretrain_ckpt_path), "checkpoints_tp", os.path.basename(pretrain_ckpt_path))
-    tp_ckpt_path = "/project/cosmos/qianlim/checkpoints/edify_video4/CTRL_7Bv1_001/CTRL_7Bv1pt3_lvg_tp_121frames_control_input_human_kpts_block3_newdata_fixedCondLoader_fulldata128n/checkpoints/iter_000036000.pt"
+    tp_ckpt_path = os.path.join("checkpoints", os.path.dirname(pretrain_ckpt_path), "checkpoints_tp", os.path.basename(pretrain_ckpt_path))
     config = make_ctrlnet_config_7b_training(hint_key=key, num_control_blocks=num_control_blocks, pretrain_model_path=tp_ckpt_path)
     cs.store(
         group="experiment",

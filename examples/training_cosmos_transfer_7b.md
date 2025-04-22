@@ -219,7 +219,7 @@ To customize your training, see the job (experiment) config in `cosmos_transfer1
 It is also possible to modify config parameters from command line. For example:
 
 ```bash
-torchrun --nproc_per_node=8 -m cosmos_transfer1.diffusion.training.train --config=cosmos_transfer1/diffusion/config/config_train.py -- experiment=CTRL_7Bv1pt3_lvg_tp_121frames_control_input_edge_block3_pretrain trainer.max_iter=100 checkpoint.save_iter=50
+torchrun --nproc_per_node=8 -m cosmos_transfer1.diffusion.training.train --config=cosmos_transfer1/diffusion/config/config_train.py -- experiment=CTRL_7Bv1pt3_lvg_tp_121frames_control_input_edge_block3_pretrain trainer.max_iter=100 checkpoint.save_iter=40
 ```
 
 This will update the maximum training iterations to 100 (default in the registered experiments: 999999999) and checkpoint saving frequency to 50 (default: 1000).
@@ -237,6 +237,10 @@ checkpoints/cosmos_transfer1_pretrain/CTRL_7Bv1_lvg/CTRL_7Bv1pt3_lvg_tp_121frame
 ```
 
 Since the `experiment` is uniquely associated with its checkpoint directory, rerunning the same training command after an unexpected interruption will automatically resume from the latest saved checkpoint.
+
+### 7. Inference Using Trained Models
+- Convert the TP checkpoints to FSDP checkpoint using [this script](scripts/convert_ckpt_tp_to_fsdp.py).
+- Run inference steps as in the [inference README](./inference_cosmos_transfer1_7b.md).
 
 ## FAQ
 **Q1: What if I want to use my own control input type? How should I modify the code?**  
