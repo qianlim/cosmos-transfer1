@@ -14,31 +14,32 @@
 # limitations under the License.
 
 """
-Usage (run from Cosmos-Transfer1 root directory):
-    torchrun --nproc_per_node=8 -m scripts.convert_checkpoints_tp_to_fsdp > output.txt
-    
+Usage:
+    torchrun --nproc_per_node=8 -m scripts.convert_ckpt_fsdp_to_tp > output.txt
+
 This script is designed to convert a Tensor Parallel (TP) checkpoint
 to a Fully Sharded Data Parallel (FSDP) compatible format for a video diffusion model.
 
-Using experiment `BASE2B001_002_128N_LR-14_VideoImage_1-1` as an example:
+Using experiment `CTRL_7Bv1pt3_lvg_tp_121frames_control_input_seg_block3_posttrain` as an example:
 For a model trained with Tensor Parallel (TP), the checkpoints are saved in the following formats:
 ```
-edify_video4/BASE2B001/BASE2B001_002_128N_LR-14_VideoImage_1-1/checkpoints/iter_000250000_model_mp_0.pt
-edify_video4/BASE2B001/BASE2B001_002_128N_LR-14_VideoImage_1-1/checkpoints/iter_000250000_model_mp_1.pt
-...
+    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000100_model_mp_0.pt"
+    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000100_model_mp_1.pt"
+    ...
+    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000100_model_mp_7.pt"
 ```
 
-where `*_model_mp_0.pt` and `*_model_mp_1.pt` are the model checkpoints for the two TP ranks.
+where `*_model_mp_0.pt` and `*_model_mp_1.pt` are the model checkpoints for the eight TP ranks.
 
 This script will load the TP model checkpoint and convert it to a FSDP-compatible format.
 The converted checkpoints will be saved
 to a new directory `fsdp_checkpoints` under the same experiment directory, e.g.,
- `edify_video4/BASE2B001/BASE2B001_002_128N_LR-14_VideoImage_1-1/fsdp_checkpoints/`.
+ `checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/fsdp_checkpoints/`.
 
 It has the following formats:
 ```
-iter_000250000_reg_model.pt
-iter_000250000_ema_model.pt
+iter_000000100_reg_model.pt
+iter_000000100_ema_model.pt
 ```
 """
 
@@ -46,19 +47,152 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import transformer_engine as te
+import yaml
+
 from megatron.core import parallel_state
+from collections import OrderedDict
 
-from imaginaire.utils import log
-from projects.cosmos.diffusion.v1.config.base.vae import DummyJointImageVideoConfig
-from projects.cosmos.diffusion.v1.model import finalize_model_grads
-from projects.cosmos.diffusion.v1.tensor_parallel_test import (
-    assert_close_gradients,
-    copy_params_from_tp,
-    get_video_batch,
-)
+from cosmos_transfer1.diffusion.training.train import instantiate_model
+from cosmos_transfer1.diffusion.config.config_train import make_config
+from cosmos_transfer1.utils import log
+from cosmos_transfer1.utils.config_helper import override
+from cosmos_transfer1.utils.easy_io import easy_io
+from cosmos_transfer1.utils.misc import set_random_seed
 
 
-def convert_tp_checkpoint_to_fsdp(experiment: str, checkpoint_path: str, output_directory: str) -> None:
+@torch.no_grad
+def copy_params_from_tp(model: nn.Module, model_tp: nn.Module, tp_size: int) -> None:
+    orig_tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    # create temporary parallel_state for parameters & buffer copy
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+
+    match_layers = OrderedDict()
+    ddp_group = parallel_state.get_data_parallel_group()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    assert tp_size == parallel_state.get_tensor_model_parallel_world_size(), (
+        "TP group init is wrong"
+    )
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+    def record_match_layer(name, param, param_chunk, policy):
+        match_layers[name] = {
+            "shape": list(param.shape),
+            "copied_name": name,
+            "copied_shape": list(param_chunk.shape),
+            "policy": policy,
+            "type": "param",
+        }
+
+    for (name, param), (name_tp, param_tp) in zip(
+        model.named_parameters(), model_tp.named_parameters()
+    ):
+        module_name_hierarchy = name.split(".")
+        submodule_name = ".".join(module_name_hierarchy[:-1])
+        submodule = model.get_submodule(submodule_name)
+        submodule_tp = model_tp.get_submodule(submodule_name)
+
+        if isinstance(submodule, nn.Linear) and isinstance(
+            submodule_tp, te.pytorch.Linear
+        ):
+            # get parallel mode and copy weights
+            if module_name_hierarchy[-1] == "weight":
+                if submodule_tp.parallel_mode == "column":
+                    param_chunks = param.chunk(tp_size, dim=0)
+                    record_match_layer(
+                        name, param, param_chunks[tp_rank], f"column_rank{tp_rank}"
+                    )
+                    param_tp_chunks = [
+                        torch.zeros_like(param_tp) for _ in range(tp_size)
+                    ]
+                    dist.all_gather(param_tp_chunks, param_tp, tp_group, async_op=False)
+                    for _tp_rank in range(tp_size):
+                        param_chunks[_tp_rank].copy_(
+                            param_tp_chunks[_tp_rank], non_blocking=True
+                        )
+                elif submodule_tp.parallel_mode == "row":
+                    param_chunks = param.chunk(tp_size, dim=1)
+                    record_match_layer(
+                        name, param, param_chunks[tp_rank], f"row_rank{tp_rank}"
+                    )
+                    param_tp_chunks = [
+                        torch.zeros_like(param_tp) for _ in range(tp_size)
+                    ]
+                    dist.all_gather(param_tp_chunks, param_tp, tp_group, async_op=False)
+                    for _tp_rank in range(tp_size):
+                        param_chunks[_tp_rank].copy_(
+                            param_tp_chunks[_tp_rank], non_blocking=True
+                        )
+                else:
+                    record_match_layer(name, param, param_tp, "direct")
+                    param.copy_(param_tp, non_blocking=True)
+            elif module_name_hierarchy[-1] == "bias":
+                raise NotImplementedError("Bias is not supported yet.")
+        else:
+            record_match_layer(name, param, param_tp, "direct")
+            param.copy_(param_tp, non_blocking=True)
+
+    # Important to also copy buffer as logvar has randomness.
+    for (name, buffer), (name_tp, buffer_tp) in zip(
+        model.named_buffers(), model_tp.named_buffers()
+    ):
+        if buffer.size() == buffer_tp.size():
+            match_layers[name] = {
+                "shape": buffer.shape,
+                "copied_name": name_tp,
+                "copied_shape": buffer_tp.shape,
+                "policy": "direct",
+                "type": "buffer",
+            }
+            buffer.copy_(buffer_tp, non_blocking=True)
+        else:
+            if "bias" in name:
+                raise NotImplementedError("Bias is not supported yet.")
+
+            if "model_ema" in name:
+                module_name = name.replace("-", ".")
+                module_name = module_name.replace("model_ema", "model")
+                if (
+                    "column" in match_layers[module_name]["policy"]
+                    or "row" in match_layers[module_name]["policy"]
+                ):
+                    dim = 0 if "column" in match_layers[module_name]["policy"] else 1
+                    buffer_chunks = buffer.chunk(tp_size, dim=dim)
+                    buffer_tp_chunks = [
+                        torch.zeros_like(buffer_tp) for _ in range(tp_size)
+                    ]
+                    dist.all_gather(
+                        buffer_tp_chunks, buffer_tp, tp_group, async_op=False
+                    )
+                    for _tp_rank in range(tp_size):
+                        buffer_chunks[_tp_rank].copy_(
+                            buffer_tp_chunks[_tp_rank], non_blocking=True
+                        )
+            else:
+                log.info(f"{name} is not copied due to size mismatch.")
+
+    dist.barrier(ddp_group)
+    dist.barrier(tp_group)
+    # convert match_layers to yaml and save it to disk
+    yaml_fp = f"/tmp/match_layers_rank{dist.get_rank()}_tp_rank{tp_rank}.yaml"
+    with open(yaml_fp, "w") as f:
+        yaml.dump(match_layers, f)
+
+    # recover the original parallel_state
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=orig_tp_size)
+
+    return
+
+
+def convert_tp_checkpoint_to_fsdp(
+    experiment: str,
+    checkpoint_path: str,
+    output_directory: str,
+    include_base_model_in_ctrlnet_ckpt: bool = False,
+) -> None:
     """
     Convert a Tensor Parallel (TP) checkpoint to a Fully Sharded Data Parallel (FSDP) compatible format.
 
@@ -82,16 +216,6 @@ def convert_tp_checkpoint_to_fsdp(experiment: str, checkpoint_path: str, output_
 
     """
     log.info(f"Converting TP checkpoint to FSDP for experiment: {experiment}")
-    from omegaconf import OmegaConf
-
-    from imaginaire.lazy_config import LazyCall as L
-    from imaginaire.utils import distributed
-    from imaginaire.utils.config_helper import override
-    from imaginaire.utils.easy_io import easy_io
-    from imaginaire.utils.misc import set_random_seed
-    from projects.cosmos.diffusion.v1.config.config import make_config
-    from projects.cosmos.diffusion.v1.model import DiffusionModel
-    from projects.edify_image.v4.train import instantiate_model
 
     # Clean up any existing parallel state
     parallel_state.destroy_model_parallel()
@@ -113,82 +237,25 @@ def convert_tp_checkpoint_to_fsdp(experiment: str, checkpoint_path: str, output_
         override_tp,
     )
 
-    # TODO: (qsh 2024-08-17) Remove these temporary configurations once the real VAE is implemented
-    OmegaConf.set_struct(DummyJointImageVideoConfig, False)
-    config_tp.model.vae = DummyJointImageVideoConfig
-    config_tp.model.vae.pixel_chunk_duration = 121
-    config_tp.model.vae.latent_chunk_duration = 16
-
-    # Configure for DDP (Distributed Data Parallel) and disable FSDP for now
-    config_tp.trainer.distributed_parallelism = "ddp"
-    config_tp.model.fsdp_enabled = False
-    config_tp.model_obj = L(DiffusionModel)(config=None)
-
-    # Set up S3 backend for checkpoint loading/saving
-    easy_io.set_s3_backend(
-        backend_args={
-            "backend": "s3",
-            "path_mapping": {
-                "s3://rundir/": f"s3://checkpoints/{config_tp.job.path}/",
-            },
-            "s3_credential_path": config_tp.checkpoint.save_to_object_store.credentials,
-        }
-    )
-
     # Initialize trainer, model, optimizer, scheduler, and grad scaler for TP
     trainer_tp = config_tp.trainer.type(config_tp)
-    tp_group = parallel_state.get_tensor_model_parallel_group()
+    # tp_group = parallel_state.get_tensor_model_parallel_group()
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    global_tp_src_rank = parallel_state.get_tensor_model_parallel_src_rank()
+    # global_tp_src_rank = parallel_state.get_tensor_model_parallel_src_rank()
     global_rank = dist.get_rank()
 
     # Set random seed by global rank to ensure diversity within TP groups
     set_random_seed(global_rank)
     model_tp = instantiate_model(config_tp, trainer_tp).cuda()
-    optimizer_tp, scheduler_tp = model_tp.init_optimizer_scheduler(config_tp.optimizer, config_tp.scheduler)
+    optimizer_tp, scheduler_tp = model_tp.init_optimizer_scheduler(
+        config_tp.optimizer, config_tp.scheduler
+    )
     grad_scaler_tp = torch.amp.GradScaler("cuda", **config_tp.trainer.grad_scaler_args)
 
     # Load checkpoint and prepare model for training
+    log.info("Loading checkpoint...")
     trainer_tp.checkpointer.load(model_tp, optimizer_tp, scheduler_tp, grad_scaler_tp)
     model_tp.on_train_start()
-    model_tp_ddp = distributed.parallel_model_wrapper(config_tp.trainer.ddp, model_tp)
-
-    # We intentionally set random seed by global rank to ensure ranks in the same TP group
-    # have different random seeds. Our model broadcast data/noises so this should not affect the results.
-    # We also re-generate the batch to ensure sync works.
-    set_random_seed(global_rank)
-    data_batch = get_video_batch(num_frames=121)
-    if global_rank != global_tp_src_rank:
-        data_batch = get_video_batch(num_frames=121)  # Re-generate batch to ensure sync
-
-    # Run forward pass with TP model
-    log.info("Running model_tp_ddp")
-    set_random_seed(global_rank)
-    output_batch_with_tp, loss_with_tp = model_tp_ddp.training_step(data_batch, iteration=0)
-
-    # Extract and verify x0 predictions and losses across TP ranks
-    x0_pred_with_tp_B_Q_T_H_W = output_batch_with_tp["model_pred"].x0
-    gathered_loss_with_tp = [torch.randn_like(loss_with_tp) for _ in range(tp_size)]
-    dist.all_gather(gathered_loss_with_tp, loss_with_tp, tp_group)
-    torch.testing.assert_close(gathered_loss_with_tp[0], gathered_loss_with_tp[1])
-    gathered_x0_pred_with_tp = [torch.randn_like(x0_pred_with_tp_B_Q_T_H_W) for _ in range(tp_size)]
-    dist.all_gather(gathered_x0_pred_with_tp, x0_pred_with_tp_B_Q_T_H_W, tp_group)
-    torch.testing.assert_close(gathered_x0_pred_with_tp[0], gathered_x0_pred_with_tp[1])
-
-    # Perform backward pass and finalize gradients for TP model
-    loss_with_tp.backward()
-    finalize_model_grads([model_tp])
-
-    # Store gradients for later comparison
-    names = []
-    grads_with_tp = []
-    for name, p in model_tp.named_parameters():
-        if p.grad is not None:
-            grads_with_tp.append(p.grad.clone())
-            names.append(name)
-
-    # Clear gradients to prepare for non-TP model
-    model_tp.zero_grad()
 
     # Initialize and prepare the non-TP model
     parallel_state.destroy_model_parallel()
@@ -208,89 +275,39 @@ def convert_tp_checkpoint_to_fsdp(experiment: str, checkpoint_path: str, output_
         ],
     )
 
-    OmegaConf.set_struct(DummyJointImageVideoConfig, False)
-    config.model.vae = DummyJointImageVideoConfig
-    config.model.vae.pixel_chunk_duration = 121
-    config.model.vae.latent_chunk_duration = 16
-
-    # Configure for DDP and disable FSDP for now
-    config.trainer.distributed_parallelism = "ddp"
-    config.model.fsdp_enabled = False
-    config.model_obj = L(DiffusionModel)(config=None)
-
     # Initialize non-TP model and copy parameters from TP model
     trainer = config.trainer.type(config)
     model = instantiate_model(config, trainer).cuda()
     model.on_train_start()
     copy_params_from_tp(model, model_tp, tp_size=tp_size)
-    model_ddp = distributed.parallel_model_wrapper(config.trainer.ddp, model)
-
-    # To test the correctness of TP, we will sync the input data across all ranks.
-    set_random_seed(global_rank)
-    data_batch = get_video_batch(num_frames=121)
-    for value in data_batch.values():
-        if isinstance(value, torch.Tensor):
-            dist.broadcast(value, global_tp_src_rank, group=tp_group)
-
-    # Run `training_step`. Since diffusion training involves noise sampling, set the random seed to ensure
-    # we sample the same noise across all ranks.
-    log.info("Running model_ddp")
-    set_random_seed(global_tp_src_rank)
-    output_batch_without_tp, loss_without_tp = model_ddp.training_step(data_batch, iteration=0)
-
-    # Extract and verify x0 predictions and losses for non-TP model
-    x0_pred_without_tp_B_Q_T_H_W = output_batch_without_tp["model_pred"].x0
-    gathered_loss = [torch.randn_like(loss_without_tp) for _ in range(parallel_state.get_data_parallel_world_size())]
-    dist.all_gather(gathered_loss, loss_without_tp, group=tp_group)
-    torch.testing.assert_close(gathered_loss[0], gathered_loss[1])
-    gathered_x0_pred = [torch.randn_like(x0_pred_without_tp_B_Q_T_H_W) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered_x0_pred, x0_pred_without_tp_B_Q_T_H_W, group=tp_group)
-    torch.testing.assert_close(gathered_x0_pred[0], gathered_x0_pred[1])
-
-    # Perform backward pass for non-TP model
-    loss_without_tp.backward()
-
-    # Store gradients for comparison
-    names = []
-    grads_without_tp = []
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            grads_without_tp.append(p.grad.clone())
-            names.append(name)
-
-    # Compare outputs between TP and non-TP models
-    tols = dict(atol=4.5e-2, rtol=2e-2)
-    torch.testing.assert_close(x0_pred_without_tp_B_Q_T_H_W, x0_pred_with_tp_B_Q_T_H_W, **tols)
-    log.info("Outputs match", rank0_only=False)
-
-    # Compare losses between TP and non-TP models
-    torch.testing.assert_close(loss_with_tp, loss_without_tp)
-    log.info("Losses match", rank0_only=False)
-
-    # Compare gradients between TP and non-TP models
-    tols = dict(atol=1.2e-1, rtol=1.6e-2)
-    assert_close_gradients(
-        grads_with_tp, grads_without_tp, tols=tols, names=names, verbose=True, tp_group=tp_group, tp_size=tp_size
-    )
-    log.info("Gradients match", rank0_only=False)
-
-    # Clean up parallel state
-    parallel_state.destroy_model_parallel()
 
     # Save the converted model checkpoints
     if torch.distributed.get_rank() == 0:
         # Save regular model checkpoint
         checkpoint_name = os.path.basename(checkpoint_path)
         reg_model_checkpoint_name = checkpoint_name.replace(".pt", "_reg_model.pt")
-        reg_model_path = os.path.join("s3://checkpoints-us-east-1", output_directory, reg_model_checkpoint_name)
+        reg_model_path = os.path.join(output_directory, reg_model_checkpoint_name)
         easy_io.dump(model.state_dict()["model"], reg_model_path)
 
         # Save EMA model checkpoint with necessary post-processing
-        ema_state_dict = {k.replace("-", "."): v for k, v in model.state_dict()["ema"].items()}
+        ema_state_dict = {
+            k.replace("-", "."): v for k, v in model.state_dict()["ema"].items()
+        }
         for key in ["net.pos_embedder.seq", "logvar.0.freqs", "logvar.0.phases"]:
             ema_state_dict[key] = model.state_dict()["model"][key]
-        ema_model_checkpoint_name = checkpoint_name.replace(".pt", "_ema_model.pt")
-        ema_model_path = os.path.join("s3://checkpoints-us-east-1", output_directory, ema_model_checkpoint_name)
+
+        if include_base_model_in_ctrlnet_ckpt:
+            # Copy base model keys to ema dict for controlnets.
+            for key in model.state_dict()["model"].keys():
+                if key.startswith("base_model") and key not in ema_state_dict:
+                    ema_state_dict[key] = model.state_dict()["model"][key]
+
+            ema_model_checkpoint_name = checkpoint_name.replace(".pt", "_ema_model.pt")
+        else:
+            ema_model_checkpoint_name = checkpoint_name.replace(
+                ".pt", "_ema_model_only.pt"
+            )
+        ema_model_path = os.path.join(output_directory, ema_model_checkpoint_name)
         easy_io.dump(ema_state_dict, ema_model_path)
 
         log.info(
@@ -301,7 +318,11 @@ def convert_tp_checkpoint_to_fsdp(experiment: str, checkpoint_path: str, output_
 
 
 if __name__ == "__main__":
-    experiment = "BASE002_003_512N_LR-143_VideoImage_1-1"
-    checkpoint_path = "edify_video4/BASE002/BASE002_003_512N_LR-143_VideoImage_1-1/checkpoints/iter_000058000.pt"
-    output_directory = "edify_video4/BASE002/BASE002_003_512N_LR-143_VideoImage_1-1/fsdp_checkpoints/"
+    # Example: Assume the TP checkpoint is saved for the VisControl at iteration 100 in the path below.
+    experiment = "CTRL_7Bv1pt3_lvg_tp_121frames_control_input_seg_block3_posttrain"
+    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000004.pt"
+    output_directory = os.path.dirname(checkpoint_path).replace(
+        "checkpoints", "fsdp_checkpoints"
+    )
+    os.makedirs(output_directory, exist_ok=True)
     convert_tp_checkpoint_to_fsdp(experiment, checkpoint_path, output_directory)
