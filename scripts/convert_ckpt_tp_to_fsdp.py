@@ -318,9 +318,9 @@ def convert_tp_checkpoint_to_fsdp(
 if __name__ == "__main__":
     # Example: Assume the TP checkpoint is saved for the VisControl at iteration 100 in the path below.
     experiment = "CTRL_7Bv1pt3_lvg_tp_121frames_control_input_seg_block3_posttrain"
-    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000004.pt"
+    checkpoint_path = f"checkpoints/cosmos_transfer1_posttrain/CTRL_7Bv1_lvg/{experiment}/checkpoints/iter_000000100.pt"
     output_directory = os.path.dirname(checkpoint_path).replace(
-        "checkpoints", "fsdp_checkpoints"
+        f"{experiment}/checkpoints", f"{experiment}/fsdp_checkpoints"
     )
     os.makedirs(output_directory, exist_ok=True)
     convert_tp_checkpoint_to_fsdp(experiment, checkpoint_path, output_directory)
