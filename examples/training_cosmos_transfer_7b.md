@@ -17,7 +17,7 @@ We support the following Cosmos-Transfer1 models for pre-training and post-train
 | Cosmos-Transfer1-7B [Segmentation]      | **Supported**| 8 NVIDIA GPUs*                         |
 | Cosmos-Transfer1-7B [Vis]               | **Supported**| 8 NVIDIA GPUs*                         |
 
-**\*** `H100-80GB` or `A100-80GB` GPUs are recommended. 
+**\*** 80GB GPU memory required for training. `H100-80GB` or `A100-80GB` GPUs are recommended. 
 
 ## Environment setup
 
