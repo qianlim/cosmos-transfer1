@@ -29,6 +29,7 @@ from cosmos_transfer1.utils import log
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+
 class Timesteps(nn.Module):
     def __init__(self, num_channels):
         super().__init__()
