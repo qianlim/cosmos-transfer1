@@ -52,3 +52,4 @@ torchvision==0.21.0
 transformers==4.49.0
 tqdm==4.66.5
 vllm==0.8.0
+webdatasetng
