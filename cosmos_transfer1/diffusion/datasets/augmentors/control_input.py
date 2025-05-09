@@ -1274,7 +1274,7 @@ class AddControlInputKeypoint(Augmentor):
                 f"control_input_human_kpts already processed, shape={data_dict['control_input_keypoint'].shape}, dtype={data_dict['control_input_keypoint'].dtype}, value range: {data_dict['control_input_keypoint'].min()}, {data_dict['control_input_keypoint'].max()}"
             )
             return data_dict
-        import ipdb; ipdb.set_trace()
+
         human_annotations = data_dict.pop("keypoint")
         frames = data_dict["video"]
         _, T, H, W = frames.shape
